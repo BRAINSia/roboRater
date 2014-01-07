@@ -1,3 +1,5 @@
+*.csv
+*.*~
 *.py[cod]
 
 # C extensions

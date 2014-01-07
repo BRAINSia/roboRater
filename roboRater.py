@@ -127,7 +127,7 @@ def transform(record, b_T1_path, t_T1_path, outpath, force=False):
         print bfit.cmdline
         print ""
         result = bfit.run()
-        print "Result is: ", result
+        # print "Result is: ", result
         assert os.path.exists(transform_path)
         assert os.path.exists(deformedImageName)
     return transform_path
@@ -355,6 +355,9 @@ def setQAResult(experiment, session, values):
         connection = connectToPostgres(database='AutoWorkUp')
         cursor = connection.cursor()
         try:
+            print ""
+            print insert
+            print ""
             cursor.execute(insert)
         except sql.Error as err:
             print err.pgcode, ':', err.pgerror
