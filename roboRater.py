@@ -89,7 +89,7 @@ LABELS = {"caudate_left": 1,
 # BAD =  0 # 15 # 9 # 8
 ### END HACK
 
-def connectToPostgres(user='autoworkup', database='imagingmeasurements'):
+def connectToPostgres(user='autoworkup', database='sinapse_db'):
     """
     Connect to postgres databases at psych-db.psychiatry.uiowa.edu
     Nota Bene: You must have your password in your keyring
@@ -157,15 +157,15 @@ def find_record(benchmark_dir, session):
     if SQL_ACCESS:
         raise NotImplementedError
         benchmark_query = """SELECT
-          derived_images._project,
-          derived_images._subject
+          _project,
+          _subject
         FROM
-          public.derived_images
+          autoworkup_scm.derived_images
         WHERE
-          derived_images.location = %s AND
-          derived_images._analysis = %s AND
-          derived_images.status = 'R' AND
-          derived_images._session = %s;
+          autoworkup_scm.derived_images.location = %s AND
+          autoworkup_scm.derived_images._analysis = %s AND
+          autoworkup_scm.derived_images.status = 'R' AND
+          autoworkup_scm.derived_images._session = %s;
         """
         connection = connectToPostgres(database='AutoWorkUp')
         cursor = connection.cursor()
@@ -278,12 +278,12 @@ def qualityThreshold(d):
 
 
 def getQAResult(column, experiment, session):
-    sqlCommand = "SELECT image_reviews.{column} FROM \
-    public.image_reviews, public.derived_images WHERE \
-    derived_images.record_id = image_reviews.record_id AND \
-    derived_images._analysis = '{experiment}' AND \
-    derived_images._session = '{session}' \
-    ORDER BY image_reviews.review_time DESC \
+    sqlCommand = "SELECT autoworkup_scm.image_reviews.{column} FROM \
+    autoworkup_scm.image_reviews, autoworkup_scm.derived_images WHERE \
+    autoworkup_scm.derived_images.record_id = autoworkup_scm.image_reviews.record_id AND \
+    autoworkup_scm.derived_images._analysis = '{experiment}' AND \
+    autoworkup_scm.derived_images._session = '{session}' \
+    ORDER BY autoworkup_scm.image_reviews.review_time DESC \
     LIMIT 1".format(column=column, experiment=experiment, session=session)
     if SQL_ACCESS:
         raise NotImplementedError
@@ -303,7 +303,7 @@ def getQAResult(column, experiment, session):
 
 
 def flagForReview():
-    query = "SELECT qa_code FROM \"QA_mapping\" WHERE human = 'needs review'"
+    query = "SELECT qa_code FROM autoworkup_scm.\"QA_mapping\" WHERE human = 'needs review'"
     if SQL_ACCESS:
         raise NotImplementedError
     else:
@@ -329,7 +329,7 @@ def getT1T2TissueLabels(experiment, session, values):
 
 
 def setQAResult(experiment, session, values):
-    insert = "INSERT INTO image_reviews ( \
+    insert = "INSERT INTO autoworkup_scm.image_reviews ( \
     accumben_right, accumben_left, \
     caudate_right, caudate_left, \
     globus_right, globus_left, \
@@ -346,9 +346,9 @@ def setQAResult(experiment, session, values):
     ({putamen_right}), ({putamen_left}), \
     ({thalamus_right}), ({thalamus_left}), \
     ({t1_average}), ({labels_tissue}), ({t2_average}), \
-    (SELECT reviewer_id FROM  public.reviewers WHERE reviewers.login = 'roborater'), \
-    (SELECT record_id FROM public.derived_images WHERE derived_images._analysis = '{experiment}' AND \
-    derived_images._session = '{session}') \
+    (SELECT reviewer_id FROM autoworkup_scm.reviewers WHERE autoworkup_scm.reviewers.login = 'roborater'), \
+    (SELECT record_id FROM autoworkup_scm.derived_images WHERE autoworkup_scm.derived_images._analysis = '{experiment}' AND \
+    autoworkup_scm.derived_images._session = '{session}') \
     );".format(experiment=experiment, session=session, **values)
     if SQL_ACCESS:
         raise NotImplementedError
@@ -370,11 +370,11 @@ def setQAResult(experiment, session, values):
 
 
 def checkForReview(experiment, session):
-    sqlCommand = "SELECT image_reviews.review_id FROM \
-    public.image_reviews, public.derived_images WHERE \
-    derived_images.status != 'L' AND derived_images.record_id = image_reviews.record_id AND \
-    derived_images._analysis = '{experiment}' AND derived_images._session = '{session}' \
-    ORDER BY image_reviews.review_time DESC LIMIT 1;""".format(experiment=experiment, session=session)
+    sqlCommand = "SELECT autoworkup_scm.image_reviews.review_id FROM \
+    autoworkup_scm.image_reviews, autoworkup_scm.derived_images WHERE \
+    autoworkup_scm.derived_images.status != 'L' AND autoworkup_scm.derived_images.record_id = autoworkup_scm.image_reviews.record_id AND \
+    autoworkup_scm.derived_images._analysis = '{experiment}' AND autoworkup_scm.derived_images._session = '{session}' \
+    ORDER BY autoworkup_scm.image_reviews.review_time DESC LIMIT 1;""".format(experiment=experiment, session=session)
     connection = connectToPostgres(database='AutoWorkUp')
     cursor = connection.cursor()
     try:
