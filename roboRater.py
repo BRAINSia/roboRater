@@ -1,17 +1,25 @@
 """
 Usage:
-  roboRater [-b | --benchmark] DIR1 [-t | --test] DIR2 [-s | --session SESSION] [-o | --outdir] OUTDIR [-r | --report] FILE
   roboRater -h | --help
   roboRater -v | --version
+  roboRater test
+  roboRater compare [-s ID | --session ID] BENCHMARK TESTDIR RESULTDIR REPORT
+
+Commands:
+  compare           Run comparison
+  test              Run doctests
+
+Arguments:
+  BENCHMARK         Benchmark experiment directory, i.e. the experiment to compare to
+  TESTDIR           Test experiment directory, i.e. the experiment to compare
+  RESULTDIR         Result experiment directory
+  REPORT            Report file path
 
 Options:
-  -h, --help                     Show this help and exit
-  -v, --version                  Print roboRater version
-  -b DIR1, --benchmark DIR1      The benchmark experiment directory, i.e. the experiment to compare to
-  -t DIR2, --test DIR2           The test experiment directory, i.e. the experiment to compare
-  -s SESSION, --session SESSION  The session to compare
-  -o OUTDIR, --outdir OUTDIR     Result output directory
-  -r FILE, --report FILE         The output report file
+  -h, --help           Show this help and exit
+  -v, --version        Print roboRater version
+  -s ID, --session ID  The session to compare
+
 """
 # -*- coding: utf-8 -*-
 # https://www.icts.uiowa.edu/jira/browse/PREDICTIMG-3082
@@ -60,6 +68,7 @@ import sys
 import os
 
 import SimpleITK as sitk
+# assert sitk.Version.MajorVersion() == '0' and sitk.Version.MinorVersion() == '6'
 
 from SEMTools import BRAINSFit
 
@@ -453,20 +462,16 @@ def roboRater(benchmark_dir, test_dir, session, outdir, outfile, force=False):
 
 
 if __name__ == "__main__":
-    import argparse
     import sys
-    parser = argparse.ArgumentParser(description='roboRater')
-    parser.add_argument('-b', '--benchmark', action='store', dest='benchmark_dir', type=str, required=True,
-                        help='The benchmark experiment directory, i.e. the experiment to compare to')
-    parser.add_argument('-t', '--test', action='store', dest='test_dir', type=str, required=True,
-                        help='The test experiment directory, i.e. the experiment to compare')
-    parser.add_argument('-s','--session', action='store', dest='session', type=str, required=True,
-                        help='Unique path to session, e.g. "site/subject/session"')
-    parser.add_argument('-o', '--outdir', action='store', dest='outdir', type=str, required=True,
-                        help='Result output directory')
-    parser.add_argument('-r','--report', action='store', dest='outfile', type=str, required=True,
-                        help='The filename for the output csv.  If it exists already, it will be appended.')
-    parser.add_argument('-f', '--force', action='store_true', dest='force_registration', required=False,
-                        help="Force registration if registered files already exist")
-    args = parser.parse_args()
-    sys.exit(roboRater(args.benchmark_dir, args.test_dir, args.session, args.outdir, args.outfile, args.force_registration))
+
+    from docopt import docopt
+
+
+    args = docopt(__doc__)
+    if args['test']:
+        import doctest
+
+        doctest.testmod(verbose=True)
+    else:
+        reval = roboRater(args['BENCHMARK'], args['TESTDIR'], args['--session'], args['RESULTDIR'], args['REPORT'], args['--force'])
+        sys.exit(retval)
