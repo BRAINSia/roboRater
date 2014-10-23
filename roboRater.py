@@ -1,9 +1,10 @@
 """
 Usage:
   roboRater -h | --help
-  roboRater -v | --version
-  roboRater test
-  roboRater compare [-s ID | --session ID] BENCHMARK TESTDIR RESULTDIR REPORT
+  roboRater -V | --version
+  roboRater test [-v | --verbose]
+  roboRater compare [--force] [-s ID | --session ID] BENCHMARK TESTDIR RESULTDIR REPORT
+  roboRater write [--force] (-s ID | --session ID) BENCHMARK TESTDIR RESULTDIR CSVIN SQLOUT
 
 Commands:
   compare           Run comparison
@@ -17,51 +18,12 @@ Arguments:
 
 Options:
   -h, --help           Show this help and exit
-  -v, --version        Print roboRater version
-  -s ID, --session ID  The session to compare
+  -V, --version        Print roboRater version
+  -v, --verbose        Print more testing information
+  --force              Overwrite previous results
+  -s ID, --session ID  The session to compare in the form <project>/<subject>/<session>
 
 """
-# -*- coding: utf-8 -*-
-# https://www.icts.uiowa.edu/jira/browse/PREDICTIMG-3082
-#
-# Description
-# ===========
-#
-# Create an application that compares segmentations from one experiment to another and autopopulates the QA review if the segmentations are sufficiently similar.
-#
-# Requirements
-# ============
-#
-# * query/insert records in the AutoWorkUp database
-# * writes out a report with useful stats/lists of the comparison results
-# * command line:
-#
-#     `roboRater --benchmark /path/to/benchmark/experiment/directory/ \
-#     --test /path/to/experiment/to/be/compared/directory/ \
-#     --report /path/to/report/file`
-#
-# **NOTICE**
-#
-# Must run this code in an environment with a working SEMTools package, i.e.
-#
-#     source /paulsen/Experiments/rsFMRI/rs-fMRI-pilot/ENV/bin/activate
-#     ipython notebook
-#
-# __Steps:__
-#
-# 1. SELECT all sessions where benchmark was performed
-# 1. for session in sessions:
-#     1. If files missing, add to missing_labels list
-#     1. Register the T1-average from test to benchmark
-#     1. Apply transform to test labels
-#     1. Compare using DICE and others
-#     1, If heuristics >= some value:
-#         1. INSERT corresponding benchmark QA values into test QA entry with user='roboRater'
-#         1. Add to successful count
-#     1. else:
-#         1. Add file path to failed_comparison list
-# 1. Write out report with stats, missing_labels, and failed_comparison lists
-#
 import csv
 import glob
 import sys
@@ -69,8 +31,10 @@ import os
 
 import SimpleITK as sitk
 # assert sitk.Version.MajorVersion() == '0' and sitk.Version.MinorVersion() == '6'
-
-from SEMTools import BRAINSFit
+try:
+    from AutoWorkup.SEMTools import BRAINSFit
+except:
+    pass
 
 # globals
 DICE_THRESHOLD = 0.9
@@ -98,7 +62,8 @@ LABELS = {"caudate_left": 1,
 # BAD =  0 # 15 # 9 # 8
 ### END HACK
 
-def connectToPostgres(user='autoworkup', database='sinapse_db'):
+
+def connectToPostgres(user='autoworkup', database='sinapse_db', testing=False):
     """
     Connect to postgres databases at psych-db.psychiatry.uiowa.edu
     Nota Bene: You must have your password in your keyring
@@ -106,19 +71,35 @@ def connectToPostgres(user='autoworkup', database='sinapse_db'):
     Inputs:
         user: string, default = 'autoworkup'
         database: string, default = 'imagingmeasurements'
+        testing: boolean, default = False
 
-    Outputs: psycopg2.connection
+    Outputs: psycopg2._psycopg.connection
+
+    >>> connectToPostgres(testing=True).close()
+    >>> connectToPostgres(user='test', testing=True)
+    Traceback (most recent call last):
+    ...
+    AssertionError: Connection not successful!
+
     """
+    connection = None
     password = keyring.get_password('Postgres', user)
-    connection = sql.connect(host='psych-db.psychiatry.uiowa.edu', port=5432, database=database,
-                             user=user, password=password)
+    if testing:
+        host = 'pre-psych-db.psychiatry.uiowa.edu'
+        password = 'ch41rcrush3r'
+    else:
+        host = 'psych-db.psychiatry.uiowa.edu'
+    try:
+        connection = sql.connect(host=host, port=5432, database=database,
+                                 user=user, password=password)
+    except:
+        assert isinstance(connection, sql._psycopg.connection), "Connection not successful!"
     return connection
 
-def transform(record, b_T1_path, t_T1_path, outpath, force=False):
-    deformedImageName = os.path.join(outpath, record[0], record[1], record[2], 'T1ToTest.nii.gz')
-    transform_path = os.path.join(outpath, record[0], record[1], record[2], 'benchmarkToTest.mat')
-    if not force and os.path.exists(transform_path) and os.path.exists(deformedImageName):
-        return transform_path
+
+def transform(fixed_path, moving_path, transform_path, image_path, force=False):
+    if not force and os.path.exists(transform_path) and os.path.exists(image_path):
+        pass
     else:
         print "**** RUNNING BRAINSFit() ****"
         bfit = BRAINSFit()
@@ -126,9 +107,9 @@ def transform(record, b_T1_path, t_T1_path, outpath, force=False):
         inputs.useRigid = True
         inputs.costMetric = 'MMI'
         inputs.numberOfSamples = 100000
-        inputs.fixedVolume = b_T1_path
-        inputs.movingVolume = t_T1_path
-        inputs.outputVolume = deformedImageName
+        inputs.fixedVolume = fixed_path
+        inputs.movingVolume = moving_path
+        inputs.outputVolume = image_path
         inputs.outputTransform = transform_path
         if not os.path.exists(os.path.dirname(transform_path)):
             os.makedirs(os.path.dirname(transform_path))
@@ -138,21 +119,16 @@ def transform(record, b_T1_path, t_T1_path, outpath, force=False):
         result = bfit.run()
         # print "Result is: ", result
         assert os.path.exists(transform_path)
-        assert os.path.exists(deformedImageName)
-    return transform_path
+        assert os.path.exists(image_path)
+    return sitk.ReadTransform(transform_path)
 
 
-def resample(moving, fixed, outfile, tfile, interpolator, force=False):
-    if not force and os.path.exists(outfile):
-        return 0
-    else:
-        m_image = sitk.ReadImage(moving)
-        f_image = sitk.ReadImage(fixed)
-        mytransform = sitk.ReadTransform(tfile)
+def resample(moving, fixed, transform=sitk.Transform(), interpolator=sitk.sitkNearestNeighbor, cast=sitk.sitkUInt8):
+        m_image = sitk.Cast(moving, cast)
+        f_image = sitk.Cast(fixed, cast)
         outImage = f_image
-        outImage = sitk.Resample(m_image, f_image, mytransform, interpolator)
-        sitk.WriteImage(outImage, outfile)
-    return 0
+        outImage = sitk.Resample(m_image, f_image, transform, interpolator)
+        return outImage
 
 
 def find_record(benchmark_dir, session):
@@ -218,6 +194,33 @@ def getVolumes(labelImageName, compare):
     return compare
 
 
+def getBenchmarkQA(benchmark, session, labelstr, benchValues):
+    isFound = False
+    for temp in benchValues:
+        if temp['session'] == session and temp['benchmark'] == benchmark:
+            isFound = True
+            break
+    if isFound and temp[labelstr] in ('1', '5'):
+        return True
+    if not isFound:
+        print "No matching benchmark record found"
+    return False
+
+
+def mergeLabels(test, benchmark, labelstr):
+    label = LABELS[labelstr]
+    threshed = sitk.BinaryThreshold(benchmark,
+                                     lowerThreshold=(label - 0.5),
+                                     upperThreshold=(label + 0.5),
+                                     insideValue=label,
+                                     outsideValue=0)
+    threshed = sitk.Cast(threshed, sitk.sitkUInt8)
+    cleaned = (test != label) * test  # zero out bad label
+    cleaned = (threshed != label) * cleaned  # zero out where 'benchmark' will go
+    cleaned = threshed + cleaned
+    return cleaned
+
+
 def writeCSV(compare, csvfile, baseline, test):
     # [Struct, vol, hausdorff, hausdorffAvg, dice, border, baseline, test]
     with open(csvfile, 'w') as fid:
@@ -264,8 +267,8 @@ def compareLabels(benchmark, test):
         return out
 
     # MAIN compareLabels
-    a = sitk.ReadImage(benchmark)
-    b = sitk.ReadImage(test)
+    a = benchmark
+    b = test
     retval = {}
     for key, value in LABELS.items():
         a_label = (a == value)
@@ -286,17 +289,48 @@ def qualityThreshold(d):
         return False
 
 
-def getQAResult(column, experiment, session):
-    sqlCommand = "SELECT autoworkup_scm.image_reviews.{column} FROM \
-    autoworkup_scm.image_reviews, autoworkup_scm.derived_images WHERE \
-    autoworkup_scm.derived_images.record_id = autoworkup_scm.image_reviews.record_id AND \
-    autoworkup_scm.derived_images._analysis = '{experiment}' AND \
-    autoworkup_scm.derived_images._session = '{session}' \
-    ORDER BY autoworkup_scm.image_reviews.review_time DESC \
-    LIMIT 1".format(column=column, experiment=experiment, session=session)
+def getQAResult(experiment, session, column='*'):
+    """
+    >>> print getQAResult('l_caudate', '20131119_TrackOn_ManualResults', '218087801_20120907_30')
+    <BLANKLINE>
+    SELECT autoworkup_scm.image_reviews.l_caudate FROM
+        autoworkup_scm.image_reviews NATURAL JOIN
+        autoworkup_scm.derived_images
+    WHERE
+        autoworkup_scm.derived_images._analysis = '20131119_TrackOn_ManualResults' AND
+        autoworkup_scm.derived_images._session = '218087801_20120907_30'
+    ORDER BY autoworkup_scm.image_reviews.review_time DESC
+    LIMIT 1;
+    """
+    sqlCommand = """
+SELECT autoworkup_scm.image_reviews.{column} FROM
+    autoworkup_scm.image_reviews NATURAL JOIN
+    autoworkup_scm.derived_images
+WHERE
+    (autoworkup_scm.derived_images."_analysis" = '{experiment}' OR
+	 autoworkup_scm.derived_images."_analysis" = substring('{experiment}' FROM \'[0-9]{8}_[A-Za-z]*_\') || \'ManualResults\')
+    autoworkup_scm.derived_images._session = '{session}'
+ORDER BY autoworkup_scm.image_reviews.review_time DESC
+LIMIT 1;""".format(column=column, experiment=experiment, session=session)
+    return sqlCommand
+
+
+def getQARecord(experiment, session, testing=False):
+    """
+    >>> print getQARecord('20131119_TrackOn_ManualResults', '218087801_20120907_30', testing=True)
+    <BLANKLINE>
+    SELECT autoworkup_scm.image_reviews.* FROM
+        autoworkup_scm.image_reviews NATURAL JOIN
+        autoworkup_scm.derived_images
+    WHERE
+        autoworkup_scm.derived_images._analysis = '20131119_TrackOn_ManualResults' AND
+        autoworkup_scm.derived_images._session = '218087801_20120907_30'
+    ORDER BY autoworkup_scm.image_reviews.review_time DESC
+    LIMIT 1;
+    """
     if SQL_ACCESS:
         raise NotImplementedError
-        connection = connectToPostgres(database='AutoWorkUp')
+        connection = connectToPostgres(testing=testing)
         cursor = connection.cursor()
         try:
             cursor.execute(sqlCommand)
@@ -308,6 +342,7 @@ def getQAResult(column, experiment, session):
             cursor.close()
             connection.close()
     else:
+        sqlCommand = getQAResult(experiment, session, '.')
         return sqlCommand
 
 
@@ -406,24 +441,37 @@ def writeSQL(filename, sql_cmd):
         fid.flush()
 
 
-def roboRater(benchmark_dir, test_dir, session, outdir, outfile, force=False):
+def roboRater(benchmark_dir, test_dir, session, outpath, outfile, force=False):
     record = tuple(session.split(os.path.sep))
     session = record[-1]
     b_record, b_path, b_T1_path, fixed = createPaths(record, benchmark_dir)
     t_record, t_path, t_T1_path, moving = createPaths(record, test_dir)
     b_experiment = os.path.basename(benchmark_dir)
     t_experiment = os.path.basename(test_dir)
-    if SQL_ACCESS and checkForReview(t_experiment, session):
-        print "Already reviewed.  Skipping..."
-        return 0
-    if SQL_ACCESS and not checkForReview(b_experiment, session):
-        print "No previous review to compare with.  Skipping..."
-        return 0
-    transform_path = transform(record, b_T1_path, t_T1_path, outdir, force)
-    registered = os.path.join(os.path.dirname(transform_path), os.path.basename(moving))
-    resample(moving, fixed, registered, transform_path, interpolator=sitk.sitkNearestNeighbor, force=force)
-    assert os.path.exists(registered), "Registered test file must exist!"
-    compare = compareLabels(fixed, registered)
+    if SQL_ACCESS:
+        if checkForReview(t_experiment, session):
+            print "Already reviewed.  Skipping..."
+            return 1
+        if not checkForReview(b_experiment, session):
+            print "No previous review to compare with.  Skipping..."
+            return 2
+
+    base = os.path.join(outpath, record[0], record[1], record[2])
+    tx_path = os.path.join(base, 'benchmarkToTest.mat')
+    image_path = os.path.join(base, 'T1ToTest.nii.gz')
+    resample_path = os.path.join(base, 'all_Labels_seg_fixed.nii.gz')
+
+    if not force and os.path.exists(tx_path):
+         benchmark2testTx = sitk.ReadImage(tx_path)
+    else:
+        benchmark2testTx = transform(t_T1_path, b_T1_path, tx_path, image_path)
+
+    if not force and os.path.exists(resample_path):
+        resampledImg = sitk.ReadImage(resample_path)
+    else:
+        resampledImg = resample(moving, fixed, benchmark2testTx, interpolator=sitk.sitkNearestNeighbor)
+        sitk.WriteImage(resampledImg, resample_path)
+    assert os.path.exists(resample_path), "Registered test file must exist!"
     ### HACK: testing
     # global bad, good
     # compare = {}
@@ -438,19 +486,105 @@ def roboRater(benchmark_dir, test_dir, session, outdir, outfile, force=False):
     #     else:
     #         print label
     #         compare[label] = {'dice': 0.90 - sys.float_info.epsilon}  # ALL SHOULD FAIL
+    compare = compareLabels(resampledImg, testImg)
     values = {}
     for labelImageName in LABELS.keys():
         # stats = getVolumes(registered, compare)
         if qualityThreshold(compare[labelImageName]['dice']):
-    #         good += 1
+            # good += 1
             values[labelImageName] = getQAResult(labelImageName, b_experiment, session)
         else:
-    #         bad += 1
+            #  bad += 1
             values[labelImageName] = flagForReview()
     values = getT1T2TissueLabels(b_experiment, session, values)
     # assert good == GOOD, good
     # assert bad == BAD, bad
     ### END HACK: testing
+    results = setQAResult(t_experiment, session, values)
+    if not SQL_ACCESS:
+        sqlFile = os.path.join(outpath, record[0], record[1], record[2], 'batchRated.sql')
+        writeSQL(sqlFile, results)
+    else:
+        csvFile = os.path.join(outpath, record[0], record[1], record[2], outfile)
+        writeCSV(results, csvFile, b_record[0], t_record[0])
+    return 0
+
+
+def roboWriter(session=None, BENCHMARK=None, TESTDIR=None, RESULTDIR=None, CSVIN=None, SQLOUT=None, **args):
+    """
+    >>> roboWriter('218087801_20120907_30', '/Shared/johnsonhj/TrackOn/Experiments/20131119_TrackOn_ManualResults', '/Shared/johnsonhj/TrackOn/Experiments/20131119_TrackOn_Results', '/tmp/roboWriterTest', 'csvfile', 'sqlfile')
+    SELECT roboWrite_fn('20131119_TrackOn_ManualResults', '20131119_TrackOn_Results', '218087801_20120907_30')
+    """
+    benchValues = {}
+    for labelImageName in LABELS.keys():
+        benchValues[labelImageName] = getQAResult(labelImageName, b_experiment, session)
+    if copyBench:
+        assert SQL_ACCESS, "Error: Cannot copy benchmark labels without access to database!"
+        # good = ???
+        # for label in benchValues.keys():
+        #     if bv[label] == good:
+        #
+    record = tuple(session.split(os.path.sep))
+    session = record[-1]
+    b_record, b_path, b_T1_path, moving = createPaths(record, benchmark_dir)
+    t_record, t_path, t_T1_path, fixed = createPaths(record, test_dir)
+    b_experiment = os.path.basename(benchmark_dir)
+    t_experiment = os.path.basename(test_dir)
+    if SQL_ACCESS:
+        if checkForReview(t_experiment, session):
+            print "Already reviewed.  Skipping..."
+            return 1
+        if not checkForReview(b_experiment, session):
+            print "No previous review to compare with.  Skipping..."
+            return 2
+
+    base = os.path.join(outpath, record[0], record[1], record[2])
+    tx_path = os.path.join(base, 'benchmarkToTest.mat')
+    image_path = os.path.join(base, 'T1ToTest.nii.gz')
+    resample_path = os.path.join(base, 'all_Labels_seg_fixed.nii.gz')
+    if not force and os.path.exists(tx_path):
+         benchmark2testTx = sitk.ReadImage(tx_path)
+    else:
+        benchmark2testTx = transform(t_T1_path, b_T1_path, tx_path, image_path, force)
+    if not force and os.path.exists(resample_path):
+        resampledImg = sitk.ReadImage(resample_path)
+    else:
+        resampledImg = resample(moving, fixed, benchmark2testTx, interpolator=sitk.sitkNearestNeighbor)
+        sitk.WriteImage(resampledImg, resample_path)
+
+    testImg = sitk.ReadImage(fixed)
+    compare = compareLabels(resampledImg, testImg)
+    values = {}
+    benchValues = []
+    with open(CSVIN, 'rb') as csvin:
+        reader = csv.DictReader(csvin, delimiter=',')
+        for row in reader:
+            benchValues.append(row)
+    # Evaluate each label
+    labelKeys = LABELS.keys(); labelKeys.sort()
+    for labelImageName in labelKeys:
+        if qualityThreshold(compare[labelImageName]['dice']):
+            values[labelImageName] = getQAResult(labelImageName, b_experiment, session)
+        elif getBenchmarkQA(b_experiment, session, labelImageName, benchValues):
+            # region in test is 'bad' compared to benchmark AND region in benchmark is 'good'
+            if 'linearImg' not in locals():
+                linearImg = resample(moving, fixed, transform, interpolator=sitk.sitkLinear, cast=sitk.sitkFloat32)
+            linearImg = sitk.Cast(mergeLabels(fixedImg, linearImg, labelImageName), sitk.sitkFloat32)
+            values[labelImageName] = 'SELECT qa_code FROM autoworkup_scm."QA_mapping" WHERE human = "roboWriter-acceptable"'
+        else:
+            values[labelImageName] = flagForReview()
+    # Write final label image
+    if 'linearImg' in locals():
+        stripcount = len('.nii.gz')
+        clean_fname = os.path.basename(moving)[:-stripcount] + '_roboRaterCleaned.nii.gz'
+        registered_path = os.path.join(os.path.dirname(transform_path), clean_fname)
+        sitk.WriteImage(sitk.Cast(linearImg, sitk.sitkUInt8), registered_path)
+    else:
+        registered_path = os.path.join(os.path.dirname(transform_path), os.path.basename(moving))
+        sitk.WriteImage(resampledImg, registered_path)
+    assert os.path.exists(registered_path), "Registered test file must exist!"
+    # Create the image review record
+    values = getT1T2TissueLabels(b_experiment, session, values)
     results = setQAResult(t_experiment, session, values)
     if not SQL_ACCESS:
         sqlFile = os.path.join(outdir, record[0], record[1], record[2], 'batchRated.sql')
@@ -466,12 +600,23 @@ if __name__ == "__main__":
 
     from docopt import docopt
 
-
     args = docopt(__doc__)
     if args['test']:
         import doctest
 
-        doctest.testmod(verbose=True)
-    else:
+        # SQL_ACCESS = False
+        # doctest.testmod(verbose=True)
+        SQL_ACCESS = True
+        import psycopg2 as sql
+        import keyring
+
+        doctest.testmod(verbose=args['--verbose'])
+    elif args['compare']:
         reval = roboRater(args['BENCHMARK'], args['TESTDIR'], args['--session'], args['RESULTDIR'], args['REPORT'], args['--force'])
+        sys.exit(retval)
+    elif args['write']:
+        inputs = {}
+        for key in args.keys():
+            inputs[key.strip('-')] = args.pop(key)
+        print roboWriter(**inputs)
         sys.exit(retval)
