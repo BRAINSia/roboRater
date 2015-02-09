@@ -3,17 +3,19 @@ Usage:
   roboRater -h | --help
   roboRater -V | --version
   roboRater test [-v | --verbose]
-  roboRater compare [--force] [-r ID | --record ID] BENCHMARK TESTDIR RESULTDIR REPORT
-  roboRater write [--force] (-r ID | --record ID) BENCHMARK TESTDIR RESULTDIR CSVIN SQLOUT
+  roboRater compare [--force] CONFIG TEST REPORT
+  roboRater write   [--force] TEST BENCHMARK RESULTS CSVIN SQLOUT
 
 Commands:
   compare           Run comparison
   test              Run doctests
+  write             Run comparison and create merged segmentations based on results
 
 Arguments:
+  CONFIG            Configuration file for inputs/outputs
   BENCHMARK         Benchmark experiment directory, i.e. the experiment to compare to
-  TESTDIR           Test experiment directory, i.e. the experiment to compare
-  RESULTDIR         Result experiment directory
+  TEST              Test experiment directory (with site/subject/session), i.e. the experiment to compare
+  RESULTS           Result experiment directory
   REPORT            Report file path
   CSVIN             Comma-separated file path with headings
   SQLOUT            SQL-generated output file name
@@ -23,7 +25,6 @@ Options:
   -V, --version        Print roboRater version
   -v, --verbose        Print more testing information
   --force              Overwrite previous results
-  -r ID, --record ID   A record identifier in the form <project>/<subject>/<session>
 
 """
 import csv
@@ -38,6 +39,10 @@ try:
     from AutoWorkup.SEMTools import BRAINSFit
 except:
     warnings.warn("Cannot find Python wrapping for BRAINSFit", RuntimeWarning)
+try:
+    import sinapse.path
+except:
+    raise
 
 # globals
 DICE_THRESHOLD = 0.9
@@ -46,18 +51,6 @@ if SQL_ACCESS:
     import psycopg2 as sql
     import keyring
 
-LABELS = {"caudate_left": 1,
-          "caudate_right": 2,
-          "putamen_left": 3,
-          "putamen_right": 4,
-          "hippocampus_left": 5,
-          "hippocampus_right": 6,
-          "thalamus_left": 7,
-          "thalamus_right": 8,
-          "accumben_left": 9,
-          "accumben_right": 10,
-          "globus_left": 11,
-          "globus_right": 12}
 ### HACK: testing
 # good = 0
 # bad = 0
@@ -163,18 +156,17 @@ def resample(moving, fixed, transform=sitk.Transform(), interpolator=sitk.sitkNe
     return outImage
 
 
-def find_files(*args):
+def find_files(path, t1_suffix, labels_suffix):
     """
-    >>> find_files('/Shared/paulsen/Experiments/20131124_PREDICTHD_Results','PHD_024','0029','34504')
+    >>> find_files('/Shared/paulsen/Experiments/20131124_PREDICTHD_Results/PHD_024/0029/34504', 'TissueClassify/t1_average_BRAINSABC.nii.gz', 'CleanedDenoisedRFSegmentations/allLabels_seg.nii.gz')
     ('/Shared/paulsen/Experiments/20131124_PREDICTHD_Results/PHD_024/0029/34504/TissueClassify/t1_average_BRAINSABC.nii.gz', '/Shared/paulsen/Experiments/20131124_PREDICTHD_Results/PHD_024/0029/34504/CleanedDenoisedRFSegmentations/allLabels_seg.nii.gz')
     """
-    path = os.path.join(*args)
     # if not os.path.isdir(path) or not os.path.exists(path):
     #     os.makedirs(path)
     assert os.path.isdir(path) and os.path.exists(path), path
-    t1_path = os.path.join(path, 'TissueClassify', 't1_average_BRAINSABC.nii.gz')
+    t1_path = os.path.join(path, t1_suffix)
     assert os.path.exists(t1_path), "File not found: {0}".format(t1_path)
-    labels_path = os.path.join(path, 'CleanedDenoisedRFSegmentations', 'allLabels_seg.nii.gz')
+    labels_path = os.path.join(path, labels_suffix)
     assert os.path.exists(labels_path), "File not found: {0}".format(labels_path)
     return t1_path, labels_path
 
@@ -255,7 +247,18 @@ def writeCSV(compare, csvfile, baseline, test):
             writer.writerow(temp)
 
 
-def compare_labels(benchmark, test):
+def createLabelMapping(config):
+    retval = {}
+    for section in config.sections():
+        if config.has_option(section, 'benchmark'):
+            if config.has_option(section, 'test'):
+                retval[section] = (config.getint(section, 'benchmark'), config.getint(section, 'test'))
+            else:
+                retval[section] = (config.getint(section, 'benchmark'),) * 2
+    return retval
+
+
+def compare_labels(benchmark, test, labelMap):
     """
     >>> compare_labels(sitk.ReadImage('tests/target.nii.gz'), sitk.ReadImage('tests/benchmark.nii.gz'))
     {'globus_right': {'dice': 0.0}, 'caudate_right': {'dice': 0.0}, 'thalamus_right': {'dice': 0.0}, 'globus_left': {'dice': 0.0}, 'hippocampus_left': {'dice': 0.054785020804438284}, 'putamen_left': {'dice': 0.0}, 'accumben_left': {'dice': 0.0}, 'hippocampus_right': {'dice': 0.0}, 'thalamus_left': {'dice': 0.0}, 'putamen_right': {'dice': 0.38096171756286457}, 'caudate_left': {'dice': 0.0639269406392694}, 'accumben_right': {'dice': 0.0}}
@@ -306,9 +309,9 @@ def compare_labels(benchmark, test):
     a = benchmark
     b = test
     retval = {}
-    for key, value in LABELS.items():
-        a_label = (a == value)
-        b_label = (b == value)
+    for key, (alabel, blabel) in labelMap.items():
+        a_label = (a == alabel)
+        b_label = (b == blabel)
         result = {}
         # result = hausdorff(a_label, b_label)
         # result['border'] = border(a_label, b_label)
@@ -487,22 +490,21 @@ def writeSQL(filename, sql_cmd):
         fid.write(sql_cmd + '\n')
         fid.flush()
 
-def splitRecord(record):
-    return tuple(record.split(os.path.sep))
 
-
-def common(record, BENCHMARK, TESTDIR, RESULTDIR, force=False):
-    (project, subject, session) = splitRecord(record)
+def common(config, TEST, force=False):
+    BENCHMARK = config.get('benchmark', 'base')
+    _junk, project, subject, session = sinapse.path.parse(TEST)
+    b_session = os.path.join(BENCHMARK, project, subject, session)
     try:
-        b_T1_path, moving = find_files(BENCHMARK, project, subject, session)
+        b_T1_path, moving = find_files(b_session, config.get('benchmark', 't1'), config.get('benchmark', 'labels'))
     except AssertionError:
-        raise AssertionError("No benchmark results for session {0} in ".format(session))
+        raise
     try:
-        t_T1_path, fixed = find_files(TESTDIR, project, subject, session)
+        t_T1_path, fixed = find_files(TEST, config.get('test', 't1'), config.get('test', 'labels'))
     except AssertionError:
-        raise AssertionError("No test results for session {0}".format(session))
+        raise
     b_experiment = os.path.basename(BENCHMARK)
-    t_experiment = os.path.basename(TESTDIR)
+    t_experiment = os.path.basename(TEST)
     if SQL_ACCESS:
         if checkForReview(t_experiment, session):
             print "Already reviewed.  Skipping..."
@@ -510,17 +512,17 @@ def common(record, BENCHMARK, TESTDIR, RESULTDIR, force=False):
         if not checkForReview(b_experiment, session):
             print "No previous review to compare with.  Skipping..."
             sys.exit(2)
-    return b_T1_path, sitk.ReadImage(moving), t_T1_path, sitk.ReadImage(fixed)
+    return b_T1_path, sitk.ReadImage(moving), t_T1_path, sitk.ReadImage(fixed), project, subject, session
 
 
-def roboRater(record, BENCHMARK, TESTDIR, RESULTDIR, outfile, force=False, **args):
-    b_experiment, t_experiment, project, subject, session = common(record, BENCHMARK, TESTDIR, RESULTDIR, force)
-    base = os.path.join(RESULTDIR, project, subject, session)
-    tx_path = os.path.join(base, 'benchmarkToTest.mat')
-    image_path = os.path.join(base, 'T1ToTest.nii.gz')
-    resample_path = os.path.join(base, 'all_Labels_seg_fixed.nii.gz')
+def roboRater(config, TEST, REPORT, force=False, **args):
+    b_T1_path, moving, t_T1_path, fixed, project, subject, session = common(config, TEST, force)
+    base = os.path.join(config.get('results', 'base'), project, subject, session, config.get('results', 'folder'))
+    tx_path = os.path.join(base, config.get('results', 'transform'))
+    image_path = os.path.join(base, config.get('results', 't1'))
+    resample_path = os.path.join(base, config.get('results', 'labels'))
     if not force and os.path.exists(tx_path):
-         benchmark2testTx = sitk.ReadImage(tx_path)
+         benchmark2testTx = sitk.ReadTransform(tx_path)
     else:
         benchmark2testTx = transform(t_T1_path, b_T1_path, tx_path, image_path, force)
     if not force and os.path.exists(resample_path):
@@ -528,26 +530,26 @@ def roboRater(record, BENCHMARK, TESTDIR, RESULTDIR, outfile, force=False, **arg
     else:
         resampledImg = sitk.Resample(moving, fixed, benchmark2testTx, sitk.sitkNearestNeighbor, 0.0, sitk.sitkUInt8)
         sitk.WriteImage(resampledImg, resample_path)
-    testImg = sitk.ReadImage(fixed)
-    compare = compare_labels(resampledImg, testImg)
+    labelMap = createLabelMapping(config)
+    compare = compare_labels(resampledImg, fixed, labelMap)
     values = {}
-    for labelImageName in LABELS.keys():
+    for labelImageName in labelMap.keys():
         if compare[labelImageName]['dice'] >= DICE_THRESHOLD:
             values[labelImageName] = getQAResult(labelImageName, b_experiment, session)
         else:
             values[labelImageName] = flagForReview()
-    values = getT1T2TissueLabels(b_experiment, session, values)
-    results = setQAResult(t_experiment, session, values)
+    values = getT1T2TissueLabels(os.path.basename(config.get('benchmark', 'base')), session, values)
+    results = setQAResult(os.path.basename(config.get('test', 'base')), session, values)
     if not SQL_ACCESS:
-        sqlFile = os.path.join(RESULTDIR, project, subject, session, 'batchRated.sql')
+        sqlFile = os.path.join(config.get('results', 'base'), project, subject, session, REPORT)
         writeSQL(sqlFile, results)
     else:
-        csvFile = os.path.join(outpath, project, subject, session, outfile)
+        csvFile = os.path.join(outpath, project, subject, session, REPORT)
         writeCSV(results, csvFile, b_record[0], t_record[0])
     return 0
 
 
-def roboWriter(record, BENCHMARK, TESTDIR, RESULTDIR, CSVIN=None, SQLOUT=None, force=False, **args):
+def roboWriter(record, BENCHMARK, TEST, RESULTS, CSVIN=None, SQLOUT=None, force=False, **args):
     """
     >>> roboWriter('HDNI_002/218087801/218087801_20120907_30', '/Shared/johnsonhj/TrackOn/Experiments/20131119_TrackOn_ManualResults', '/Shared/johnsonhj/TrackOn/Experiments/20131119_TrackOn_Results', '/tmp/roboWriterTest', 'csvfile', 'sqlfile')
     Traceback (most recent call last):
@@ -559,7 +561,7 @@ def roboWriter(record, BENCHMARK, TESTDIR, RESULTDIR, CSVIN=None, SQLOUT=None, f
     values = {}
     labelKeys = LABELS.keys(); labelKeys.sort()
     try:
-        b_T1_path, moving, t_T1_path, fixed = common(record, BENCHMARK, TESTDIR, RESULTDIR, force)
+        b_T1_path, moving, t_T1_path, fixed = common(record, BENCHMARK, TEST, force)
     except AssertionError, err:
         if err.message.startswith('No benchmark'):
             for key in labelKeys:
@@ -567,13 +569,13 @@ def roboWriter(record, BENCHMARK, TESTDIR, RESULTDIR, CSVIN=None, SQLOUT=None, f
             values['t1_average'] = flagForReview()
             values['labels_tissue'] = flagForReview()
             values['t2_average'] = flagForReview()
-            return writeReview(TESTDIR, record, RESULTDIR, SQLOUT, values)
+            return writeReview(TEST, record, RESULTS, SQLOUT, values)
         elif err.message.startswith('No test'):
             print "Session was not processed in testing experiment"
             return 0
 
     (project, subject, session) = splitRecord(record)
-    base = os.path.join(RESULTDIR, project, subject, session)
+    base = os.path.join(RESULTS, project, subject, session)
     tx_path = os.path.join(base, 'benchmarkToTest.mat')
     image_path = os.path.join(base, 'T1ToTest.nii.gz')
     resample_path = os.path.join(base, 'all_Labels_seg_resampled.nii.gz')
@@ -619,15 +621,15 @@ def roboWriter(record, BENCHMARK, TESTDIR, RESULTDIR, CSVIN=None, SQLOUT=None, f
     assert os.path.exists(cleaned_path), "Registered test file must exist!"
     # Create the image review record
     values = getT1T2TissueLabels(b_experiment, session, values)
-    return writeReview(TESTDIR, record, RESULTDIR, SQLOUT, values)
+    return writeReview(TEST, record, RESULTS, SQLOUT, values)
 
-def writeReview(TESTDIR, record, RESULTDIR, SQLOUT, values):
+def writeReview(TEST, record, RESULTS, SQLOUT, values):
     (project, subject, session) = splitRecord(record)
-    results = setQAResult(os.path.basename(TESTDIR), session, values)
-    sqlDir = os.path.join(RESULTDIR, project, subject, session)
+    results = setQAResult(os.path.basename(TEST), session, values)
+    sqlDir = os.path.join(RESULTS, project, subject, session)
     if not os.path.isdir(sqlDir):
         os.makedirs(sqlDir)
-    sqlFile = os.path.join(RESULTDIR, project, subject, session, SQLOUT)
+    sqlFile = os.path.join(RESULTS, project, subject, session, SQLOUT)
     writeSQL(sqlFile, results)
     return 0
 
@@ -636,6 +638,7 @@ if __name__ == "__main__":
     import sys
 
     from docopt import docopt
+    import ConfigParser
 
     args = docopt(__doc__)
     inputs = {}
@@ -646,7 +649,9 @@ if __name__ == "__main__":
         SQL_ACCESS = False
         doctest.testmod(verbose=inputs['verbose'])
     elif inputs['compare']:
-        retval = roboRater(**inputs)
+        config = ConfigParser.SafeConfigParser()
+        config.read(inputs['CONFIG'])
+        retval = roboRater(config, **inputs)
         sys.exit(retval)
     elif inputs['write']:
         retval = roboWriter(**inputs)
